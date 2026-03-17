@@ -6,6 +6,9 @@
 # Frontend (Flutter)
 # ==========================================
 
+.codex/
+
+
 # Miscellaneous
 frontend/.dart_tool/
 frontend/.flutter-plugins

@@ -61,7 +61,7 @@
 **1. 克隆项目**
 
 ```bash
-git clone https://github.com/你的用户名/image-converter-pro.git
+git clone https://github.com/XxSbyH/image_converter_pro.git
 cd image-converter-pro
 ```
 
@@ -71,12 +71,6 @@ cd image-converter-pro
 ```bash
 # 双击运行或命令行执行
 setup.bat
-```
-
-**Linux/macOS 用户**：
-```bash
-chmod +x setup.sh
-./setup.sh
 ```
 
 **3. 手动安装（可选）**
