@@ -11,10 +11,18 @@ class ImageListItem extends StatefulWidget {
     super.key,
     required this.imageFile,
     required this.onDelete,
+    this.onRetry,
+    this.onViewErrorDetail,
+    this.canDrag = false,
+    this.reorderIndex,
   });
 
   final ImageFileModel imageFile;
   final VoidCallback onDelete;
+  final VoidCallback? onRetry;
+  final VoidCallback? onViewErrorDetail;
+  final bool canDrag;
+  final int? reorderIndex;
 
   @override
   State<ImageListItem> createState() => _ImageListItemState();
@@ -41,7 +49,17 @@ class _ImageListItemState extends State<ImageListItem> {
               horizontal: 12,
               vertical: 6,
             ),
-            leading: _buildThumbnail(),
+            leading: SizedBox(
+              width: 78,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _buildDragHandle(),
+                  const SizedBox(width: 6),
+                  _buildThumbnail(),
+                ],
+              ),
+            ),
             title: Text(
               widget.imageFile.fileName,
               maxLines: 1,
@@ -62,6 +80,21 @@ class _ImageListItemState extends State<ImageListItem> {
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildDragHandle() {
+    final canDrag = widget.canDrag && widget.reorderIndex != null;
+    if (!canDrag) {
+      return const SizedBox(width: 20);
+    }
+    return ReorderableDragStartListener(
+      index: widget.reorderIndex!,
+      child: const Icon(
+        Icons.drag_indicator_rounded,
+        size: 20,
+        color: Color(0xFF8E9AAC),
       ),
     );
   }
@@ -151,11 +184,52 @@ class _ImageListItemState extends State<ImageListItem> {
           ],
         );
       case 'failed':
-        return Text(
-          '$sizeText · 处理失败: ${imageFile.errorMessage ?? '请重试'}',
-          style: TextStyle(color: statusColor),
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '$sizeText · 处理失败: ${imageFile.errorMessage ?? '请重试'}',
+              style: TextStyle(color: statusColor),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            if (widget.onRetry != null || widget.onViewErrorDetail != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Wrap(
+                  spacing: 10,
+                  runSpacing: 4,
+                  children: [
+                    if (widget.onRetry != null)
+                      TextButton.icon(
+                        onPressed: widget.onRetry,
+                        icon: const Icon(Icons.refresh_rounded, size: 16),
+                        label: const Text('重试'),
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
+                        ),
+                      ),
+                    if (widget.onViewErrorDetail != null)
+                      TextButton.icon(
+                        onPressed: widget.onViewErrorDetail,
+                        icon: const Icon(Icons.info_outline_rounded, size: 16),
+                        label: const Text('详情'),
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+          ],
         );
       default:
         final estimatedSize = imageFile.estimatedOutputSize;

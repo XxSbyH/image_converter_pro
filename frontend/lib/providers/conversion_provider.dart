@@ -27,6 +27,11 @@ class ConversionProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  void updateSettings(ConversionSettings settings) {
+    _settings = settings;
+    notifyListeners();
+  }
+
   void setProcessing(bool value) {
     _isProcessing = value;
     notifyListeners();

@@ -16,8 +16,11 @@ import '../providers/image_list_provider.dart';
 import '../screens/format_guide_screen.dart';
 import '../services/api_service.dart';
 import '../services/backend_manager.dart';
+import '../widgets/analysis_result_dialog.dart';
 import '../widgets/conversion_controls.dart';
+import '../widgets/conversion_summary_dialog.dart';
 import '../widgets/drop_zone_widget.dart';
+import '../widgets/error_detail_dialog.dart';
 import '../widgets/format_suggestion_dialog.dart';
 import '../widgets/image_list_item.dart';
 import '../widgets/progress_indicator_widget.dart';
@@ -38,12 +41,10 @@ class _HomeScreenState extends State<HomeScreen> {
   int _processingTotal = 0;
   int _processingCompleted = 0;
   int _processingFailed = 0;
-  final Map<String, double> _lastProgressValueByPath = {};
-  final Map<String, DateTime> _lastProgressUpdateByPath = {};
 
   static const int _maxFileSizeBytes = 50 * 1024 * 1024;
-  static const Duration _progressUpdateInterval = Duration(milliseconds: 180);
-  static const double _progressMinDelta = 0.02;
+  static const int _batchRequestSize = 8;
+  static const int _batchConcurrentLimit = 3;
 
   static const Set<String> _allowedExtensions = {
     'jpg',
@@ -64,7 +65,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final imageProvider = context.watch<ImageListProvider>();
     final images = imageProvider.images;
-    final failedCount = images.where((item) => item.status == 'failed').length;
+    final failedCount = imageProvider.failedCount;
     final etaSeconds = _estimateRemainingSeconds();
 
     return Shortcuts(
@@ -134,12 +135,42 @@ class _HomeScreenState extends State<HomeScreen> {
                                 onEntriesDropped: _handleDroppedEntries,
                                 showHint: false,
                                 minHeight: 320,
-                                child: ListView.builder(
+                                child: ReorderableListView.builder(
+                                  buildDefaultDragHandles: false,
+                                  onReorder: _handleReorder,
+                                  proxyDecorator: (child, index, animation) {
+                                    return AnimatedBuilder(
+                                      animation: animation,
+                                      builder: (context, child) {
+                                        final t = Curves.easeOut.transform(
+                                          animation.value,
+                                        );
+                                        final scale = 1 + (0.02 * t);
+                                        return Transform.scale(
+                                          scale: scale,
+                                          child: Material(
+                                            elevation: 8,
+                                            color: Colors.transparent,
+                                            child: Opacity(
+                                              opacity: 0.84,
+                                              child: child,
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                      child: child,
+                                    );
+                                  },
                                   itemCount: images.length,
                                   itemBuilder: (context, index) {
                                     final imageFile = images[index];
                                     return ImageListItem(
+                                      key: ValueKey(imageFile.filePath),
                                       imageFile: imageFile,
+                                      canDrag:
+                                          !_isProcessing &&
+                                          imageFile.status == 'pending',
+                                      reorderIndex: index,
                                       onDelete: () {
                                         if (imageFile.status == 'processing') {
                                           _showSnackBar(
@@ -160,6 +191,15 @@ class _HomeScreenState extends State<HomeScreen> {
                                           );
                                         }
                                       },
+                                      onRetry: imageFile.status == 'failed'
+                                          ? () => _retrySingleFailed(
+                                              imageFile.filePath,
+                                            )
+                                          : null,
+                                      onViewErrorDetail:
+                                          imageFile.status == 'failed'
+                                          ? () => _showErrorDetail(imageFile)
+                                          : null,
                                     );
                                   },
                                 ),
@@ -173,6 +213,8 @@ class _HomeScreenState extends State<HomeScreen> {
                           onPickFolder: _pickFolder,
                           onStartConversion: _startConversion,
                           onOpenFormatGuide: _showQuickFormatGuide,
+                          onAnalyze: _analyzeImages,
+                          canAnalyze: images.isNotEmpty,
                         ),
                       ],
                     ],
@@ -184,6 +226,13 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
     );
+  }
+
+  void _handleReorder(int oldIndex, int newIndex) {
+    if (_isProcessing) {
+      return;
+    }
+    context.read<ImageListProvider>().reorderPending(oldIndex, newIndex);
   }
 
   Widget _buildListToolbar({required int failedCount}) {
@@ -364,6 +413,25 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    final oversizedFiles = filesToAdd
+        .where((file) => file.lengthSync() > _maxFileSizeBytes)
+        .toList();
+    if (oversizedFiles.isNotEmpty) {
+      final allowOversized = await _confirmAction(
+        title: '检测到超大文件',
+        content: '检测到 ${oversizedFiles.length} 个文件超过 50MB，转换可能失败或超时。是否仍然添加？',
+        confirmText: '仍然添加',
+      );
+      if (!allowOversized) {
+        filesToAdd.removeWhere((file) => file.lengthSync() > _maxFileSizeBytes);
+        if (filesToAdd.isEmpty) {
+          _showSnackBar('已取消添加超大文件');
+          return;
+        }
+        _showSnackBar('已跳过 ${oversizedFiles.length} 个超大文件');
+      }
+    }
+
     if (filesToAdd.length > 100) {
       final confirm = await _confirmAction(
         title: '检测到大量图片',
@@ -522,6 +590,7 @@ class _HomeScreenState extends State<HomeScreen> {
       ..updateFormat(selectedFormat)
       ..updateQuality(selectedQuality)
       ..updateOutputDirectory(outputDir);
+    final runtimeSettings = conversionProvider.settings;
 
     _showSnackBar('开始处理 ${targetPaths.length} 张图片...');
 
@@ -531,89 +600,152 @@ class _HomeScreenState extends State<HomeScreen> {
     var totalOutputBytes = 0;
     var hasFatalError = false;
 
-    _lastProgressValueByPath.clear();
-    _lastProgressUpdateByPath.clear();
-
     try {
-      for (final filePath in targetPaths) {
-        final image = imageProvider.getByPath(filePath);
-        if (image == null) {
-          if (!mounted) {
-            break;
+      for (
+        var start = 0;
+        start < targetPaths.length;
+        start += _batchRequestSize
+      ) {
+        final end = math.min(start + _batchRequestSize, targetPaths.length);
+        final chunkPaths = targetPaths.sublist(start, end);
+        final chunkFiles = <File>[];
+
+        for (final filePath in chunkPaths) {
+          final image = imageProvider.getByPath(filePath);
+          if (image == null) {
+            continue;
           }
-          setState(() {
-            _processingTotal = math.max(0, _processingTotal - 1);
-          });
+
+          try {
+            final sourceFile = File(image.filePath);
+            await _validateSourceFile(sourceFile);
+            chunkFiles.add(sourceFile);
+            imageProvider.updateImageStatusByPath(
+              filePath,
+              'processing',
+              error: null,
+              progress: null,
+              compressionRatio: null,
+              outputFileSize: null,
+            );
+          } catch (error) {
+            imageProvider.updateImageStatusByPath(
+              filePath,
+              'failed',
+              error: _friendlyError(error),
+              progress: null,
+              compressionRatio: null,
+              outputFileSize: null,
+            );
+            failedCount++;
+          }
+        }
+
+        if (chunkFiles.isEmpty) {
+          if (mounted) {
+            setState(() {
+              _processingCompleted = successCount;
+              _processingFailed = failedCount;
+            });
+          }
           continue;
         }
 
-        imageProvider.updateImageStatusByPath(
-          filePath,
-          'processing',
-          error: null,
-          progress: 0.0,
-          compressionRatio: null,
-          outputFileSize: null,
-        );
-
         try {
-          final sourceFile = File(image.filePath);
-          await _validateSourceFile(sourceFile);
-
-          final response = await _apiService.convertImage(
-            file: sourceFile,
+          final response = await _apiService.batchConvert(
+            files: chunkFiles,
             format: selectedFormat,
             quality: selectedQuality,
-            onSendProgress: (sent, total) {
-              final rawProgress = total <= 0 ? 0.0 : sent / total;
-              _updateProgressThrottled(
-                imageProvider,
-                filePath,
-                rawProgress.clamp(0.0, 1.0).toDouble(),
+            concurrentLimit: _batchConcurrentLimit,
+            watermarkEnabled: runtimeSettings.enableWatermark,
+            watermarkType: runtimeSettings.watermarkType,
+            watermarkText: runtimeSettings.watermarkText,
+            watermarkOpacity: runtimeSettings.watermarkOpacity,
+            watermarkPosition: runtimeSettings.watermarkPosition,
+            watermarkFontSize: runtimeSettings.watermarkFontSize,
+            watermarkImagePath: runtimeSettings.watermarkImagePath,
+            stripMetadata: runtimeSettings.stripMetadata,
+            metadataAuthor: runtimeSettings.metadataAuthor,
+            metadataCopyright: runtimeSettings.metadataCopyright,
+            metadataComment: runtimeSettings.metadataComment,
+          );
+          final rawResults = response['results'];
+          final results = rawResults is List ? rawResults : const [];
+
+          for (var i = 0; i < chunkFiles.length; i++) {
+            final file = chunkFiles[i];
+            final image = imageProvider.getByPath(file.path);
+            if (image == null) {
+              continue;
+            }
+            final result = i < results.length ? results[i] : null;
+            final resultMap = result is Map ? result : const {};
+            final isSuccess = resultMap['success'] == true;
+
+            if (!isSuccess) {
+              final errorMessage = resultMap['error']?.toString() ?? '处理失败';
+              imageProvider.updateImageStatusByPath(
+                file.path,
+                'failed',
+                error: _friendlyError(errorMessage),
+                progress: null,
+                compressionRatio: null,
+                outputFileSize: null,
               );
-            },
-          );
+              failedCount++;
+              continue;
+            }
 
-          final outputBase64 = response['output_base64']?.toString();
-          if (outputBase64 == null || outputBase64.isEmpty) {
-            throw const ApiException('后端未返回有效图片数据');
+            final outputBase64 = resultMap['output_base64']?.toString();
+            if (outputBase64 == null || outputBase64.isEmpty) {
+              imageProvider.updateImageStatusByPath(
+                file.path,
+                'failed',
+                error: '后端未返回有效图片数据',
+                progress: null,
+                compressionRatio: null,
+                outputFileSize: null,
+              );
+              failedCount++;
+              continue;
+            }
+
+            final outputBytes = base64Decode(outputBase64);
+            final outputPath = p.join(
+              outputDir,
+              '${p.basenameWithoutExtension(image.fileName)}.${selectedFormat.toLowerCase()}',
+            );
+            await File(outputPath).writeAsBytes(outputBytes, flush: true);
+
+            final originalSize =
+                _parseSize(resultMap['original_size']) ?? image.fileSize;
+            final outputSize =
+                _parseSize(resultMap['compressed_size']) ?? outputBytes.length;
+
+            imageProvider.updateImageStatusByPath(
+              file.path,
+              'completed',
+              error: null,
+              progress: 1.0,
+              compressionRatio: resultMap['compression_ratio']?.toString(),
+              outputFileSize: outputSize,
+            );
+            successCount++;
+            totalOriginalBytes += originalSize;
+            totalOutputBytes += outputSize;
           }
-
-          final outputBytes = base64Decode(outputBase64);
-          final outputPath = p.join(
-            outputDir,
-            '${p.basenameWithoutExtension(image.fileName)}.${selectedFormat.toLowerCase()}',
-          );
-          await File(outputPath).writeAsBytes(outputBytes, flush: true);
-
-          final originalSize =
-              _parseSize(response['original_size']) ?? image.fileSize;
-          final outputSize =
-              _parseSize(response['compressed_size']) ?? outputBytes.length;
-          imageProvider.updateImageStatusByPath(
-            filePath,
-            'completed',
-            error: null,
-            progress: 1.0,
-            compressionRatio: response['compression_ratio']?.toString(),
-            outputFileSize: outputSize,
-          );
-
-          successCount++;
-          totalOriginalBytes += originalSize;
-          totalOutputBytes += outputSize;
         } catch (error) {
-          imageProvider.updateImageStatusByPath(
-            filePath,
-            'failed',
-            error: _friendlyError(error),
-            progress: null,
-            compressionRatio: null,
-            outputFileSize: null,
-          );
-          failedCount++;
-        } finally {
-          _clearProgressThrottle(filePath);
+          for (final file in chunkFiles) {
+            imageProvider.updateImageStatusByPath(
+              file.path,
+              'failed',
+              error: _friendlyError(error),
+              progress: null,
+              compressionRatio: null,
+              outputFileSize: null,
+            );
+            failedCount++;
+          }
         }
 
         if (!mounted) {
@@ -623,16 +755,12 @@ class _HomeScreenState extends State<HomeScreen> {
           _processingCompleted = successCount;
           _processingFailed = failedCount;
         });
-
-        await Future<void>.delayed(const Duration(milliseconds: 16));
       }
     } catch (error, stackTrace) {
       hasFatalError = true;
       debugPrint('批量转换出现未捕获异常: $error');
       debugPrintStack(stackTrace: stackTrace);
     } finally {
-      _lastProgressValueByPath.clear();
-      _lastProgressUpdateByPath.clear();
       if (mounted) {
         setState(() => _isProcessing = false);
       }
@@ -648,19 +776,21 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     final storageDelta = totalOriginalBytes - totalOutputBytes;
-    if (failedCount == 0) {
-      final message =
-          '转换完成！成功 $successCount 张，${_buildStorageSummary(storageDelta)}';
-      _showResultSnackBar(message, outputDir);
+    final totalHandled = successCount + failedCount;
+    if (totalHandled == 0) {
+      _showSnackBar('没有可处理的文件', isError: true);
       return;
     }
-    if (successCount > 0) {
-      final message =
-          '完成 $successCount 张，失败 $failedCount 张，${_buildStorageSummary(storageDelta)}';
-      _showResultSnackBar(message, outputDir);
-      return;
-    }
-    _showSnackBar('转换失败，请检查错误原因后重试', isError: true);
+
+    await ConversionSummaryDialog.show(
+      context,
+      total: totalHandled,
+      success: successCount,
+      failed: failedCount,
+      storageSummary: _buildStorageSummary(storageDelta),
+      onOpenOutput: () => _openOutputDirectory(outputDir),
+      onRetryFailed: failedCount > 0 ? _retryFailedItems : null,
+    );
   }
 
   Future<void> _maybeSuggestFormatForHeic(List<File> files) async {
@@ -812,41 +942,53 @@ class _HomeScreenState extends State<HomeScreen> {
     await QuickFormatGuideDialog.show(context);
   }
 
-  void _updateProgressThrottled(
-    ImageListProvider imageProvider,
-    String filePath,
-    double progress,
-  ) {
-    var normalized = progress.clamp(0.0, 1.0).toDouble();
-    if (normalized >= 1.0) {
-      normalized = 0.95;
+  Future<void> _analyzeImages() async {
+    if (_isProcessing) {
+      return;
     }
-
-    final now = DateTime.now();
-    final lastValue = _lastProgressValueByPath[filePath];
-    final lastTime = _lastProgressUpdateByPath[filePath];
-    final hasMeaningfulDelta =
-        lastValue == null ||
-        (normalized - lastValue).abs() >= _progressMinDelta;
-    final isIntervalReached =
-        lastTime == null || now.difference(lastTime) >= _progressUpdateInterval;
-
-    if (!hasMeaningfulDelta && !isIntervalReached && normalized < 0.95) {
+    final images = context.read<ImageListProvider>().images;
+    if (images.isEmpty) {
+      _showSnackBar('请先添加图片后再进行智能分析', isError: true);
       return;
     }
 
-    _lastProgressValueByPath[filePath] = normalized;
-    _lastProgressUpdateByPath[filePath] = now;
-    imageProvider.updateImageStatusByPath(
-      filePath,
-      'processing',
-      progress: normalized,
-    );
-  }
+    final files = <File>[];
+    for (final image in images) {
+      final file = File(image.filePath);
+      if (file.existsSync()) {
+        files.add(file);
+      }
+    }
+    if (files.isEmpty) {
+      _showSnackBar('没有可分析的本地文件', isError: true);
+      return;
+    }
 
-  void _clearProgressThrottle(String filePath) {
-    _lastProgressValueByPath.remove(filePath);
-    _lastProgressUpdateByPath.remove(filePath);
+    _showSnackBar('正在分析 ${files.length} 张图片...');
+
+    try {
+      final result = await _apiService.analyzeImages(files: files);
+      if (!mounted) {
+        return;
+      }
+      final selected = await AnalysisResultDialog.show(
+        context,
+        analysis: result,
+      );
+      if (selected == null) {
+        return;
+      }
+      final conversion = context.read<ConversionProvider>();
+      conversion.updateFormat(selected.$1);
+      conversion.updateQuality(selected.$2);
+      context.read<ImageListProvider>().updateEstimateConfig(
+        outputFormat: selected.$1,
+        quality: selected.$2,
+      );
+      _showSnackBar('已应用推荐配置：${selected.$1.toUpperCase()} / 质量 ${selected.$2}');
+    } catch (error) {
+      _showSnackBar(_friendlyError(error), isError: true);
+    }
   }
 
   int? _estimateRemainingSeconds() {
@@ -965,6 +1107,30 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     await _startConversionWithCurrentSettings(targetIndexes: failedIndexes);
+  }
+
+  Future<void> _retrySingleFailed(String filePath) async {
+    if (_isProcessing) {
+      return;
+    }
+    final provider = context.read<ImageListProvider>();
+    final images = provider.images;
+    final targetIndex = images.indexWhere(
+      (item) => item.filePath == filePath && item.status == 'failed',
+    );
+    if (targetIndex < 0) {
+      _showSnackBar('该文件不在失败状态，无需重试');
+      return;
+    }
+    await _startConversionWithCurrentSettings(targetIndexes: [targetIndex]);
+  }
+
+  Future<void> _showErrorDetail(ImageFileModel imageFile) async {
+    await ErrorDetailDialog.show(
+      context,
+      imageFile: imageFile,
+      onRetry: () => _retrySingleFailed(imageFile.filePath),
+    );
   }
 
   String _friendlyError(Object error) {
@@ -1105,22 +1271,6 @@ class _HomeScreenState extends State<HomeScreen> {
             : const Color(0xFF2E7D32),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(seconds: 3),
-      ),
-    );
-  }
-
-  void _showResultSnackBar(String message, String outputDir) {
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
-        backgroundColor: const Color(0xFF2E7D32),
-        action: SnackBarAction(
-          label: '打开文件夹',
-          onPressed: () => _openOutputDirectory(outputDir),
-        ),
       ),
     );
   }

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -61,6 +62,18 @@ class ApiService {
     int? maxHeight,
     void Function(int sent, int total)? onSendProgress,
     int retryCount = 2,
+    bool watermarkEnabled = false,
+    String watermarkType = 'text',
+    String? watermarkText,
+    int watermarkOpacity = 30,
+    String watermarkPosition = 'bottom_right',
+    int watermarkFontSize = 24,
+    String? watermarkImagePath,
+    String? watermarkImageBase64,
+    bool stripMetadata = false,
+    String? metadataAuthor,
+    String? metadataCopyright,
+    String? metadataComment,
   }) async {
     try {
       return _withRetry<Map<String, dynamic>>(() async {
@@ -72,16 +85,36 @@ class ApiService {
             ? const Duration(seconds: 180)
             : AppConfig.requestTimeout;
 
-        final formData = FormData.fromMap({
+        final resolvedWatermarkImageBase64 =
+            watermarkImageBase64 ??
+            await _encodeWatermarkImageIfNeeded(
+              enabled: watermarkEnabled,
+              type: watermarkType,
+              imagePath: watermarkImagePath,
+            );
+
+        final payload = <String, dynamic>{
           'file': await MultipartFile.fromFile(
             file.path,
             filename: p.basename(file.path),
           ),
           'format': format,
           'quality': quality,
-          ...?maxWidth != null ? {'max_width': maxWidth} : null,
-          ...?maxHeight != null ? {'max_height': maxHeight} : null,
-        });
+          if (maxWidth != null) 'max_width': maxWidth,
+          if (maxHeight != null) 'max_height': maxHeight,
+          'watermark_enabled': watermarkEnabled,
+          'watermark_type': watermarkType,
+          'watermark_text': watermarkText ?? '',
+          'watermark_opacity': watermarkOpacity.clamp(0, 100),
+          'watermark_position': watermarkPosition,
+          'watermark_font_size': watermarkFontSize.clamp(8, 160),
+          'watermark_image_base64': resolvedWatermarkImageBase64 ?? '',
+          'strip_metadata': stripMetadata,
+          'metadata_author': metadataAuthor ?? '',
+          'metadata_copyright': metadataCopyright ?? '',
+          'metadata_comment': metadataComment ?? '',
+        };
+        final formData = FormData.fromMap(payload);
         final response = await _dio.post<Map<String, dynamic>>(
           '/api/convert',
           data: formData,
@@ -105,6 +138,17 @@ class ApiService {
     int? maxHeight,
     int concurrentLimit = 3,
     int retryCount = 2,
+    bool watermarkEnabled = false,
+    String watermarkType = 'text',
+    String? watermarkText,
+    int watermarkOpacity = 30,
+    String watermarkPosition = 'bottom_right',
+    int watermarkFontSize = 24,
+    String? watermarkImagePath,
+    bool stripMetadata = false,
+    String? metadataAuthor,
+    String? metadataCopyright,
+    String? metadataComment,
   }) async {
     final limit = math.max(1, concurrentLimit);
     final results = List<Map<String, dynamic>>.generate(
@@ -112,6 +156,11 @@ class ApiService {
       (_) => {},
     );
     var nextIndex = 0;
+    final watermarkImageBase64 = await _encodeWatermarkImageIfNeeded(
+      enabled: watermarkEnabled,
+      type: watermarkType,
+      imagePath: watermarkImagePath,
+    );
 
     Future<void> worker() async {
       while (true) {
@@ -130,6 +179,18 @@ class ApiService {
             maxWidth: maxWidth,
             maxHeight: maxHeight,
             retryCount: retryCount,
+            watermarkEnabled: watermarkEnabled,
+            watermarkType: watermarkType,
+            watermarkText: watermarkText,
+            watermarkOpacity: watermarkOpacity,
+            watermarkPosition: watermarkPosition,
+            watermarkFontSize: watermarkFontSize,
+            watermarkImagePath: watermarkImagePath,
+            watermarkImageBase64: watermarkImageBase64,
+            stripMetadata: stripMetadata,
+            metadataAuthor: metadataAuthor,
+            metadataCopyright: metadataCopyright,
+            metadataComment: metadataComment,
           );
           results[current] = {
             'filename': p.basename(file.path),
@@ -153,6 +214,37 @@ class ApiService {
     await Future.wait(workers);
 
     return {'results': results};
+  }
+
+  Future<Map<String, dynamic>> analyzeImages({
+    required List<File> files,
+  }) async {
+    if (files.isEmpty) {
+      throw const ApiException('没有可分析的图片');
+    }
+    try {
+      final formData = FormData();
+      for (final file in files) {
+        formData.files.add(
+          MapEntry(
+            'files',
+            await MultipartFile.fromFile(
+              file.path,
+              filename: p.basename(file.path),
+            ),
+          ),
+        );
+      }
+      final response = await _dio.post<Map<String, dynamic>>(
+        '/api/analyze',
+        data: formData,
+      );
+      return response.data ?? <String, dynamic>{};
+    } on DioException catch (e) {
+      throw ApiException(_mapDioError(e));
+    } catch (_) {
+      throw const ApiException('智能分析失败');
+    }
   }
 
   Future<T> _withRetry<T>(
@@ -201,5 +293,28 @@ class ApiService {
       return '请求失败: $status';
     }
     return '网络错误，请检查连接';
+  }
+
+  Future<String?> _encodeWatermarkImageIfNeeded({
+    required bool enabled,
+    required String type,
+    required String? imagePath,
+  }) async {
+    if (!enabled || type.toLowerCase() != 'image') {
+      return null;
+    }
+    final path = imagePath?.trim() ?? '';
+    if (path.isEmpty) {
+      return null;
+    }
+    final file = File(path);
+    if (!await file.exists()) {
+      return null;
+    }
+    final bytes = await file.readAsBytes();
+    if (bytes.isEmpty) {
+      return null;
+    }
+    return base64Encode(bytes);
   }
 }

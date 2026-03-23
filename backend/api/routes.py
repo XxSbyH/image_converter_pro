@@ -8,11 +8,13 @@ from typing import Any
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from config import settings
+from services.image_analyzer import ImageAnalyzeError, ImageAnalyzer
 from services.image_processor import ImageProcessingError, ImageProcessor
 from utils.helpers import calc_compression_ratio, normalize_format
 
 router = APIRouter()
 processor = ImageProcessor()
+analyzer = ImageAnalyzer()
 
 
 def _validate_common(format_value: str, quality: int) -> str:
@@ -31,6 +33,20 @@ def _validate_dimensions(max_width: int | None, max_height: int | None) -> None:
         raise HTTPException(status_code=400, detail="max_width 必须大于 0")
     if max_height is not None and max_height <= 0:
         raise HTTPException(status_code=400, detail="max_height 必须大于 0")
+
+
+def _sanitize_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    sanitized = value.strip()
+    return sanitized or None
+
+
+def _validate_watermark_options(opacity: int, font_size: int) -> None:
+    if not 0 <= opacity <= 100:
+        raise HTTPException(status_code=400, detail="watermark_opacity 必须在 0-100 之间")
+    if not 8 <= font_size <= 160:
+        raise HTTPException(status_code=400, detail="watermark_font_size 必须在 8-160 之间")
 
 
 async def _validate_file(upload_file: UploadFile) -> bytes:
@@ -60,6 +76,46 @@ async def get_formats() -> dict[str, list[str]]:
     return {"input": formats, "output": formats}
 
 
+@router.post("/analyze")
+async def analyze_images(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    if not files:
+        raise HTTPException(status_code=400, detail="请至少上传一张图片")
+
+    results: list[dict[str, Any]] = []
+    successful_items: list[dict[str, Any]] = []
+
+    for file in files:
+        item: dict[str, Any] = {
+            "filename": file.filename or "",
+            "success": False,
+        }
+        try:
+            input_bytes = await _validate_file(file)
+            analysis = analyzer.analyze_bytes(input_bytes, file.filename or "")
+            item.update(
+                {
+                    "success": True,
+                    "original_size": len(input_bytes),
+                    **analysis,
+                }
+            )
+            successful_items.append(item)
+        except HTTPException as exc:
+            item["error"] = str(exc.detail)
+        except ImageAnalyzeError as exc:
+            item["error"] = str(exc)
+        except Exception as exc:  # pragma: no cover
+            item["error"] = f"分析失败: {exc}"
+        finally:
+            results.append(item)
+
+    overall = analyzer.build_overall_recommendation(successful_items)
+    return {
+        "individual_results": results,
+        "overall_recommendation": overall,
+    }
+
+
 @router.post("/convert")
 async def convert_image(
     file: UploadFile = File(...),
@@ -67,9 +123,21 @@ async def convert_image(
     quality: int = Form(85),
     max_width: int | None = Form(None),
     max_height: int | None = Form(None),
+    watermark_enabled: bool = Form(False),
+    watermark_type: str = Form("text"),
+    watermark_text: str | None = Form(None),
+    watermark_opacity: int = Form(30),
+    watermark_position: str = Form("bottom_right"),
+    watermark_font_size: int = Form(24),
+    watermark_image_base64: str | None = Form(None),
+    strip_metadata: bool = Form(False),
+    metadata_author: str | None = Form(None),
+    metadata_copyright: str | None = Form(None),
+    metadata_comment: str | None = Form(None),
 ) -> dict[str, Any]:
     target_format = _validate_common(format, quality)
     _validate_dimensions(max_width, max_height)
+    _validate_watermark_options(watermark_opacity, watermark_font_size)
     input_bytes = await _validate_file(file)
 
     try:
@@ -79,6 +147,17 @@ async def convert_image(
             quality=quality,
             max_width=max_width,
             max_height=max_height,
+            watermark_enabled=watermark_enabled,
+            watermark_type=watermark_type,
+            watermark_text=_sanitize_text(watermark_text),
+            watermark_opacity=watermark_opacity,
+            watermark_position=watermark_position,
+            watermark_font_size=watermark_font_size,
+            watermark_image_base64=_sanitize_text(watermark_image_base64),
+            strip_metadata=strip_metadata,
+            metadata_author=_sanitize_text(metadata_author),
+            metadata_copyright=_sanitize_text(metadata_copyright),
+            metadata_comment=_sanitize_text(metadata_comment),
         )
     except ImageProcessingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -105,9 +184,21 @@ async def batch_convert(
     quality: int = Form(85),
     max_width: int | None = Form(None),
     max_height: int | None = Form(None),
+    watermark_enabled: bool = Form(False),
+    watermark_type: str = Form("text"),
+    watermark_text: str | None = Form(None),
+    watermark_opacity: int = Form(30),
+    watermark_position: str = Form("bottom_right"),
+    watermark_font_size: int = Form(24),
+    watermark_image_base64: str | None = Form(None),
+    strip_metadata: bool = Form(False),
+    metadata_author: str | None = Form(None),
+    metadata_copyright: str | None = Form(None),
+    metadata_comment: str | None = Form(None),
 ) -> dict[str, list[dict[str, Any]]]:
     target_format = _validate_common(format, quality)
     _validate_dimensions(max_width, max_height)
+    _validate_watermark_options(watermark_opacity, watermark_font_size)
     results: list[dict[str, Any]] = []
 
     for file in files:
@@ -127,6 +218,17 @@ async def batch_convert(
                 quality=quality,
                 max_width=max_width,
                 max_height=max_height,
+                watermark_enabled=watermark_enabled,
+                watermark_type=watermark_type,
+                watermark_text=_sanitize_text(watermark_text),
+                watermark_opacity=watermark_opacity,
+                watermark_position=watermark_position,
+                watermark_font_size=watermark_font_size,
+                watermark_image_base64=_sanitize_text(watermark_image_base64),
+                strip_metadata=strip_metadata,
+                metadata_author=_sanitize_text(metadata_author),
+                metadata_copyright=_sanitize_text(metadata_copyright),
+                metadata_comment=_sanitize_text(metadata_comment),
             )
 
             original_size = len(input_bytes)

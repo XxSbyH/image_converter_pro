@@ -18,6 +18,9 @@ class ImageListProvider extends ChangeNotifier {
 
   bool get hasProcessing =>
       _images.any((image) => image.status == 'processing');
+  bool get hasFailedFiles => _images.any((image) => image.status == 'failed');
+  int get failedCount =>
+      _images.where((image) => image.status == 'failed').length;
 
   ImageFileModel? getByPath(String filePath) {
     for (final image in _images) {
@@ -145,6 +148,24 @@ class ImageListProvider extends ChangeNotifier {
     return removed;
   }
 
+  bool retrySingleFailed(String filePath) {
+    final index = _images.indexWhere((image) => image.filePath == filePath);
+    if (index < 0 || _images[index].status != 'failed') {
+      return false;
+    }
+    _images[index] = _withEstimate(
+      _images[index].copyWith(
+        status: 'pending',
+        errorMessage: null,
+        progress: null,
+        compressionRatio: null,
+        outputFileSize: null,
+      ),
+    );
+    notifyListeners();
+    return true;
+  }
+
   void retryFailed() {
     var updated = false;
     for (var i = 0; i < _images.length; i++) {
@@ -183,6 +204,70 @@ class ImageListProvider extends ChangeNotifier {
       notifyListeners();
     }
     return removed;
+  }
+
+  void reorderPending(int oldIndex, int newIndex) {
+    if (_images.isEmpty || oldIndex < 0 || oldIndex >= _images.length) {
+      return;
+    }
+    if (newIndex > oldIndex) {
+      newIndex -= 1;
+    }
+    if (newIndex < 0 || newIndex >= _images.length) {
+      return;
+    }
+    if (_images[oldIndex].status != 'pending') {
+      return;
+    }
+
+    final pendingIndexes = <int>[];
+    for (var i = 0; i < _images.length; i++) {
+      if (_images[i].status == 'pending') {
+        pendingIndexes.add(i);
+      }
+    }
+    if (pendingIndexes.length < 2) {
+      return;
+    }
+
+    final oldPendingPos = pendingIndexes.indexOf(oldIndex);
+    if (oldPendingPos < 0) {
+      return;
+    }
+
+    final newPendingPos = _resolvePendingPosition(pendingIndexes, newIndex);
+    if (newPendingPos < 0 || newPendingPos == oldPendingPos) {
+      return;
+    }
+
+    final pendingItems = pendingIndexes
+        .map((index) => _images[index])
+        .toList(growable: true);
+    final moved = pendingItems.removeAt(oldPendingPos);
+    pendingItems.insert(newPendingPos, moved);
+
+    for (var i = 0; i < pendingIndexes.length; i++) {
+      _images[pendingIndexes[i]] = pendingItems[i];
+    }
+    notifyListeners();
+  }
+
+  int _resolvePendingPosition(List<int> pendingIndexes, int targetIndex) {
+    if (pendingIndexes.isEmpty) {
+      return -1;
+    }
+    if (targetIndex <= pendingIndexes.first) {
+      return 0;
+    }
+    if (targetIndex >= pendingIndexes.last) {
+      return pendingIndexes.length - 1;
+    }
+    for (var i = 0; i < pendingIndexes.length; i++) {
+      if (pendingIndexes[i] >= targetIndex) {
+        return i;
+      }
+    }
+    return pendingIndexes.length - 1;
   }
 
   void updateEstimateConfig({
